@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Conway's Game of Life Duel",
+			"type": "shell",
+			"command": "C:/Users/u249989/python.exe",
+			"args": [
+				"conways_game.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
