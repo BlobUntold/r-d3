@@ -17,22 +17,25 @@ GRAY = (200, 200, 200)
 PLAYER1_COLOR = (0, 120, 255)
 PLAYER2_COLOR = (255, 80, 80)
 
-def draw_grid(screen):
-	for x in range(0, WINDOW_WIDTH, CELL_SIZE):
-		pygame.draw.line(screen, GRAY, (x, 0), (x, WINDOW_HEIGHT))
-	for y in range(0, WINDOW_HEIGHT, CELL_SIZE):
-		pygame.draw.line(screen, GRAY, (0, y), (WINDOW_WIDTH, y))
+def draw_grid(screen, scaled_cell, offset_x, offset_y):
+	for x in range(0, BOARD_WIDTH + 1):
+		px = offset_x + x * scaled_cell
+		pygame.draw.line(screen, GRAY, (px, offset_y), (px, offset_y + BOARD_HEIGHT * scaled_cell))
+	for y in range(0, BOARD_HEIGHT + 1):
+		py = offset_y + y * scaled_cell
+		pygame.draw.line(screen, GRAY, (offset_x, py), (offset_x + BOARD_WIDTH * scaled_cell, py))
 	# Divider in the middle
-	midx = (BOARD_WIDTH // 2) * CELL_SIZE
-	pygame.draw.line(screen, (80, 80, 80), (midx, 0), (midx, WINDOW_HEIGHT), width=3)
+	midx = offset_x + (BOARD_WIDTH // 2) * scaled_cell
+	pygame.draw.line(screen, (80, 80, 80), (midx, offset_y), (midx, offset_y + BOARD_HEIGHT * scaled_cell), width=3)
 
-def draw_board(screen, board):
+def draw_board(screen, board, scaled_cell, offset_x, offset_y):
 	for y in range(BOARD_HEIGHT):
 		for x in range(BOARD_WIDTH):
+			rect = (offset_x + x*scaled_cell, offset_y + y*scaled_cell, scaled_cell, scaled_cell)
 			if board[y][x] == 1:
-				pygame.draw.rect(screen, PLAYER1_COLOR, (x*CELL_SIZE, y*CELL_SIZE, CELL_SIZE, CELL_SIZE))
+				pygame.draw.rect(screen, PLAYER1_COLOR, rect)
 			elif board[y][x] == 2:
-				pygame.draw.rect(screen, PLAYER2_COLOR, (x*CELL_SIZE, y*CELL_SIZE, CELL_SIZE, CELL_SIZE))
+				pygame.draw.rect(screen, PLAYER2_COLOR, rect)
 
 def rotate_pattern(pattern, rotation):
 	# rotation: 0=0deg, 1=90deg, 2=180deg, 3=270deg
@@ -55,12 +58,19 @@ def draw_deleted_ghost(screen, deleted_blocks):
 		s_rect = pygame.Rect(x*CELL_SIZE, y*CELL_SIZE, CELL_SIZE, CELL_SIZE)
 		screen.blit(s, s_rect)
 
-def draw_ghost(screen, player, selected_pattern, placements_left, pattern_rotation):
+def draw_ghost(screen, player, selected_pattern, placements_left, pattern_rotation, scaled_cell, offset_x, offset_y):
 	mx, my = pygame.mouse.get_pos()
-	x, y = mx // CELL_SIZE, my // CELL_SIZE
+	# Map mouse to board coordinates using scale and offset
+	x = (mx - offset_x) // scaled_cell
+	y = (my - offset_y) // scaled_cell
+	try:
+		x = int(x)
+		y = int(y)
+	except Exception:
+		return
 	ghost_color = PLAYER1_COLOR if player == 1 else PLAYER2_COLOR
 	ghost_color = (*ghost_color[:3], 100)  # Add alpha for transparency
-	s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
+	s = pygame.Surface((scaled_cell, scaled_cell), pygame.SRCALPHA)
 	s.fill(ghost_color)
 	if selected_pattern:
 		pattern = rotate_pattern(PATTERNS[selected_pattern], pattern_rotation)
@@ -68,11 +78,11 @@ def draw_ghost(screen, player, selected_pattern, placements_left, pattern_rotati
 			for dx, dy in pattern:
 				px, py = x + dx, y + dy
 				if 0 <= px < BOARD_WIDTH and 0 <= py < BOARD_HEIGHT:
-					s_rect = pygame.Rect(px*CELL_SIZE, py*CELL_SIZE, CELL_SIZE, CELL_SIZE)
+					s_rect = pygame.Rect(offset_x + px*scaled_cell, offset_y + py*scaled_cell, scaled_cell, scaled_cell)
 					screen.blit(s, s_rect)
 	else:
 		if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT and placements_left > 0:
-			s_rect = pygame.Rect(x*CELL_SIZE, y*CELL_SIZE, CELL_SIZE, CELL_SIZE)
+			s_rect = pygame.Rect(offset_x + x*scaled_cell, offset_y + y*scaled_cell, scaled_cell, scaled_cell)
 			screen.blit(s, s_rect)
 
 def count_neighbors(board, x, y):
@@ -271,7 +281,19 @@ def main():
 	# Track selection for winner screen
 	winner_selected = 0  # 0: Play Again, 1: Return Home
 	ignore_mouse_until_up = False
+	suppress_next_placement = False
 	while running:
+		# Calculate scale and offset for centering (always keep aspect, never stretch, always center)
+		board_px_w = BOARD_WIDTH * CELL_SIZE
+		board_px_h = BOARD_HEIGHT * CELL_SIZE
+		scale = min(WINDOW_WIDTH / board_px_w, WINDOW_HEIGHT / board_px_h)
+		scaled_cell = max(1, int(CELL_SIZE * scale))
+		surf_w = BOARD_WIDTH * scaled_cell
+		surf_h = BOARD_HEIGHT * scaled_cell
+		offset_x = (WINDOW_WIDTH - surf_w) // 2
+		offset_y = (WINDOW_HEIGHT - surf_h) // 2
+		# Fill background before drawing anything (prevents ghost tracer and black screen)
+		screen.fill(WHITE)
 		# --- Handle winner buttons (match_winner) ---
 		if match_winner:
 			# Draw winner UI and handle input, and skip rest of loop
@@ -349,6 +371,7 @@ def main():
 				pygame.event.clear()
 				# Block all mouse events until all buttons are released
 				ignore_mouse_until_up = True
+				suppress_next_placement = True
 			continue
 		for event in pygame.event.get():
 			if ignore_mouse_until_up:
@@ -645,8 +668,17 @@ def main():
 			elif text == 'r' and selected_pattern:
 				pattern_rotation = (pattern_rotation + 1) % 4
 		elif phase == "placement" and event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+			if suppress_next_placement:
+				suppress_next_placement = False
+				continue
 			mx, my = pygame.mouse.get_pos()
-			x, y = mx // CELL_SIZE, my // CELL_SIZE
+			x = (mx - offset_x) // scaled_cell
+			y = (my - offset_y) // scaled_cell
+			try:
+				x = int(x)
+				y = int(y)
+			except Exception:
+				continue
 			if event.button == 1:
 				placed = False
 				if selected_pattern:
@@ -661,17 +693,18 @@ def main():
 						pattern_rotation = 0
 						placed = True
 				else:
-					if placements_left > 0 and board[y][x] == 0:
-						if placement_player == 1 and x < BOARD_WIDTH // 2:
-							board[y][x] = 1
-							current_round_placements[1].add((x, y))
-							placements_left -= 1
-							placed = True
-						elif placement_player == 2 and x >= BOARD_WIDTH // 2:
-							board[y][x] = 2
-							current_round_placements[2].add((x, y))
-							placements_left -= 1
-							placed = True
+					if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT:
+						if placements_left > 0 and board[y][x] == 0:
+							if placement_player == 1 and x < BOARD_WIDTH // 2:
+								board[y][x] = 1
+								current_round_placements[1].add((x, y))
+								placements_left -= 1
+								placed = True
+							elif placement_player == 2 and x >= BOARD_WIDTH // 2:
+								board[y][x] = 2
+								current_round_placements[2].add((x, y))
+								placements_left -= 1
+								placed = True
 				# If placements are used up after this click, handle turn switching or evolution start
 				if placed and placements_left == 0:
 					placement_done[placement_player] = True
@@ -778,24 +811,12 @@ def main():
 				seen_states = {}
 				round_number += 1
 
-		screen.fill(WHITE)
-		draw_board(screen, board)
-		draw_grid(screen)
-
-		deleted_blocks = set()
-		# Show ghost of deleted blocks for the current placement player if blocks are deleted this round
-		if deleted_blocks_ghost:
-			deleted_blocks = deleted_blocks_ghost
-		elif len(round_placements) >= 5 and round_number > 5:
-			# Only show deleted blocks for the current placement player
-			deleted_blocks = round_placements[round_number - 5][placement_player] if placement_player in round_placements[round_number - 5] else set()
-
+		# All overlays and placement use scale/offset
 		# Animate score if needed
 		if score_anim['active']:
 			score_anim['timer'] -= 1
 			progress = 1 - (score_anim['timer'] / SCORE_ANIM_DURATION)
 			score_anim['scale'] = SCORE_ANIM_SCALE - (SCORE_ANIM_SCALE - 1.0) * progress
-			# Fade out at end
 			if score_anim['timer'] < SCORE_ANIM_FADE:
 				score_anim['alpha'] = int(255 * (score_anim['timer'] / SCORE_ANIM_FADE))
 			else:
@@ -806,39 +827,43 @@ def main():
 				score_anim['alpha'] = 255
 				score_anim['team'] = 0
 
-		# Only show info text if enabled in settings
 		show_info_text = settings.get('show_text', True)
 
 		if phase == "placement":
 			prev_board = None
 			seen_states = {}
-			draw_ghost(screen, placement_player, selected_pattern, placements_left, pattern_rotation)
-			if deleted_blocks:
-				draw_deleted_ghost(screen, deleted_blocks)
+			draw_board(screen, board, scaled_cell, offset_x, offset_y)
+			draw_grid(screen, scaled_cell, offset_x, offset_y)
+			draw_ghost(screen, placement_player, selected_pattern, placements_left, pattern_rotation, scaled_cell, offset_x, offset_y)
+			# Info text above board
 			if show_info_text:
 				info = f"Player {placement_player}'s turn | Placements left: {placements_left}"
 				text = font.render(info, True, BLACK)
-				screen.blit(text, (10, 10))
+				info_rect = text.get_rect(center=(WINDOW_WIDTH//2, offset_y//2 if offset_y > 40 else 20))
+				screen.blit(text, info_rect)
 				patinfo = font.render("1:Glider 2:Block 3:Blinker | ESC: Deselect", True, BLACK)
-				screen.blit(patinfo, (10, 70))
-			# Only show score animation if active
+				patinfo_rect = patinfo.get_rect(center=(WINDOW_WIDTH//2, info_rect.bottom + 20))
+				screen.blit(patinfo, patinfo_rect)
+			# Score below board
+			score1 = font.render(f"Score - Player 1: {points[1]}", True, PLAYER1_COLOR)
+			score2 = font.render(f"Player 2: {points[2]}", True, PLAYER2_COLOR)
+			score_y = offset_y + surf_h + 20 if offset_y + surf_h + 40 < WINDOW_HEIGHT else WINDOW_HEIGHT - 40
+			screen.blit(score1, (offset_x, score_y))
+			screen.blit(score2, (offset_x + score1.get_width() + 30, score_y))
+			if selected_pattern and show_info_text:
+				sel = font.render(f"Selected: {selected_pattern.title()} (R: rotate, click to place)", True, (0, 120, 0))
+				sel_rect = sel.get_rect(center=(WINDOW_WIDTH//2, score_y + 30))
+				screen.blit(sel, sel_rect)
+			# Score animation always centered
 			if score_anim['active']:
 				bigfont = pygame.font.SysFont(None, 120)
 				surf = bigfont.render("SCORE!", True, score_anim['color'])
 				surf.set_alpha(score_anim['alpha'])
-				scale = score_anim['scale']
+				scale_anim = score_anim['scale']
 				w, h = surf.get_width(), surf.get_height()
-				surf2 = pygame.transform.smoothscale(surf, (int(w*scale), int(h*scale)))
+				surf2 = pygame.transform.smoothscale(surf, (int(w*scale_anim), int(h*scale_anim)))
 				rect = surf2.get_rect(center=(WINDOW_WIDTH//2, WINDOW_HEIGHT//2))
 				screen.blit(surf2, rect)
-			# Draw normal scores (no animation)
-			score1 = font.render(f"Score - Player 1: {points[1]}", True, PLAYER1_COLOR)
-			score2 = font.render(f"Player 2: {points[2]}", True, PLAYER2_COLOR)
-			screen.blit(score1, (10, 130))
-			screen.blit(score2, (10 + score1.get_width() + 30, 130))
-			if selected_pattern and show_info_text:
-				sel = font.render(f"Selected: {selected_pattern.title()} (R: rotate, click to place)", True, (0, 120, 0))
-				screen.blit(sel, (10, 100))
 		# --- Match winner check ---
 		if match_winner:
 			# Show match winner and buttons
@@ -882,6 +907,8 @@ def main():
 			continue
 
 		if phase == "evolution":
+			draw_board(screen, board, scaled_cell, offset_x, offset_y)
+			draw_grid(screen, scaled_cell, offset_x, offset_y)
 			if winner:
 				win_text = font.render(f"Player {winner} wins!", True, (0,200,0))
 				win_rect = win_text.get_rect(center=(WINDOW_WIDTH//2, 60))
