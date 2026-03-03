@@ -2,6 +2,13 @@
 import pygame
 import sys
 
+# Multiplayer imports
+import asyncio
+import threading
+import websockets
+import json
+import aioconsole
+
 # Game settings
 BOARD_WIDTH = 26
 BOARD_HEIGHT = 30
@@ -74,14 +81,14 @@ def draw_ghost(screen, player, selected_pattern, placements_left, pattern_rotati
 	s.fill(ghost_color)
 	if selected_pattern:
 		pattern = rotate_pattern(PATTERNS[selected_pattern], pattern_rotation)
-		if placements_left >= len(pattern):
+		if placements_left[player] >= len(pattern):
 			for dx, dy in pattern:
 				px, py = x + dx, y + dy
 				if 0 <= px < BOARD_WIDTH and 0 <= py < BOARD_HEIGHT:
 					s_rect = pygame.Rect(offset_x + px*scaled_cell, offset_y + py*scaled_cell, scaled_cell, scaled_cell)
 					screen.blit(s, s_rect)
 	else:
-		if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT and placements_left > 0:
+		if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT and placements_left[player] > 0:
 			s_rect = pygame.Rect(offset_x + x*scaled_cell, offset_y + y*scaled_cell, scaled_cell, scaled_cell)
 			screen.blit(s, s_rect)
 
@@ -173,7 +180,24 @@ def boards_equal(b1, b2):
 def board_hash(board):
 	return tuple(tuple(row) for row in board)
 
+def reset_game():
+	# Use settings for board size
+	global BOARD_WIDTH, BOARD_HEIGHT, WINDOW_WIDTH, WINDOW_HEIGHT
+	BOARD_WIDTH = settings['board_width']
+	BOARD_HEIGHT = settings['board_height']
+	WINDOW_WIDTH = BOARD_WIDTH * CELL_SIZE
+	WINDOW_HEIGHT = BOARD_HEIGHT * CELL_SIZE
+	# Always return placements_left and max_placements as dicts
+	return (
+		[[0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)],
+		[[0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)],
+		[], 1, 1, 1, 1,
+		{1: 5, 2: 5},
+		{1: 5, 2: 5}
+	)
+
 def main():
+	print("[DEBUG] main() started")
 	global WINDOW_WIDTH, WINDOW_HEIGHT
 	pygame.init()
 	pygame.key.start_text_input()
@@ -188,8 +212,8 @@ def main():
 	player = 1
 	first_player = 1
 	placement_player = first_player
-	placements_left = 5
-	max_placements = 5
+	placements_left = {1: 5, 2: 5}
+	max_placements = {1: 5, 2: 5}
 	font = pygame.font.SysFont(None, 32)
 	menu_font = pygame.font.SysFont(None, 48)
 	bigfont = pygame.font.SysFont(None, 120)
@@ -238,13 +262,26 @@ def main():
 		BOARD_HEIGHT = settings['board_height']
 		WINDOW_WIDTH = BOARD_WIDTH * CELL_SIZE
 		WINDOW_HEIGHT = BOARD_HEIGHT * CELL_SIZE
+		# Always return placements_left and max_placements as dicts
 		return (
 			[[0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)],
 			[[0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)],
-			[], 1, 1, 1, 1, 5, 5
+			[], 1, 1, 1, 1,
+			{1: 5, 2: 5},
+			{1: 5, 2: 5}
 		)
 
 	board, initial_board, round_placements, round_number, player, first_player, placement_player, placements_left, max_placements = reset_game()
+	if not isinstance(placements_left, dict):
+		placements_left = {1: placements_left, 2: placements_left}
+	if not isinstance(max_placements, dict):
+		max_placements = {1: max_placements, 2: max_placements}
+	placement_player = first_player
+	placements_left = max_placements
+	if not isinstance(placements_left, dict):
+		placements_left = {1: placements_left, 2: placements_left}
+	if not isinstance(max_placements, dict):
+		max_placements = {1: max_placements, 2: max_placements}
 
 	running = True
 	prev_board = None
@@ -253,11 +290,16 @@ def main():
 	current_round_placements = {1: set(), 2: set()}
 	placement_done = {1: False, 2: False}
 	prev_points = {1: 0, 2: 0}
+	last_round_snapshot = None
 
 	def start_match(reset_score=True):
 		nonlocal board, initial_board, round_placements, round_number, player, first_player, placement_player, placements_left, max_placements
 		nonlocal current_round_placements, placement_done, selected_pattern, pattern_rotation, prev_board, seen_states, deleted_blocks_ghost, winner, phase, points
 		board, initial_board, round_placements, round_number, player, first_player, placement_player, placements_left, max_placements = reset_game()
+		if not isinstance(placements_left, dict):
+			placements_left = {1: placements_left, 2: placements_left}
+		if not isinstance(max_placements, dict):
+			max_placements = {1: max_placements, 2: max_placements}
 		# Update window size and re-create display surface to match new board size
 		nonlocal screen
 		global WINDOW_WIDTH, WINDOW_HEIGHT
@@ -282,7 +324,187 @@ def main():
 	winner_selected = 0  # 0: Play Again, 1: Return Home
 	ignore_mouse_until_up = False
 	suppress_next_placement = False
+	# --- Multiplayer state ---
+
+	ws = None
+	ws_thread = None
+	ws_queue = []  # List of received messages
+	ws_send_queue = []  # List of outgoing messages
+	ws_connected = threading.Event()
+	ws_stop = threading.Event()
+
+	def ws_receiver(uri, queue, send_queue, stop_event):
+		async def run():
+			nonlocal ws_connected
+			try:
+				print("[Multiplayer] Connecting to server at", uri)
+				async with websockets.connect(uri) as websocket:
+					print("[Multiplayer] Connected to server!")
+					ws_connected.set()
+					while not stop_event.is_set():
+						# Send any outgoing messages
+						while send_queue:
+							msg = send_queue.pop(0)
+							try:
+								print(f"[Multiplayer] Sending: {msg}")
+								await websocket.send(msg)
+							except Exception as e:
+								print(f"[Multiplayer] Send error: {e}")
+								queue.append(json.dumps({"type": "error", "error": str(e)}))
+						# Receive incoming messages
+						try:
+							msg = await asyncio.wait_for(websocket.recv(), timeout=0.1)
+							print(f"[Multiplayer] Received: {msg}")
+							queue.append(msg)
+						except asyncio.TimeoutError:
+							continue
+			except Exception as e:
+				print(f"[Multiplayer] Connection error: {e}")
+				queue.append(json.dumps({"type": "error", "error": str(e)}))
+			ws_connected.clear()
+		asyncio.run(run())
+
+	def start_ws_client(uri):
+		nonlocal ws_thread
+		print(f"[Multiplayer] start_ws_client called for {uri}")
+		ws_thread = threading.Thread(target=ws_receiver, args=(uri, ws_queue, ws_send_queue, ws_stop), daemon=True)
+		ws_thread.start()
+		print(f"[Multiplayer] ws_thread started: {ws_thread.is_alive()}")
+
+	def stop_ws_client():
+		ws_stop.set()
+		if ws_thread:
+			ws_thread.join(timeout=2)
+
+	# --- End multiplayer state ---
+
+	multiplayer_mode = False
+	multiplayer_ready = False
+	multiplayer_player = None  # 1 or 2
+	# ...existing code...
 	while running:
+		# Throttle debug print to every 2 seconds
+		import time
+		if not hasattr(main, "_last_debug"):
+			main._last_debug = 0
+		now = time.time()
+		if now - main._last_debug > 2:
+			print(f"[DEBUG] Loop: phase={phase}, menu_state={menu_state}, multiplayer_mode={multiplayer_mode}")
+			main._last_debug = now
+		# --- Multiplayer: connect on lobby start (robust) ---
+		if menu_state == 'lobby' and not multiplayer_mode:
+			print("[Multiplayer] Entering lobby menu, starting client...")
+			start_ws_client("ws://localhost:8765")
+			multiplayer_mode = True
+			multiplayer_player = None
+			multiplayer_ready = False
+			print("[Multiplayer] Connecting to server...")
+		# --- Multiplayer: process received moves ---
+		if multiplayer_mode and ws_queue:
+			while ws_queue:
+				msg = ws_queue.pop(0)
+				print(f"[Multiplayer] Main loop received: {msg}")
+				try:
+					move = json.loads(msg)
+				except Exception as e:
+					print(f"[Multiplayer] JSON decode error: {e}")
+					continue
+				if move.get("type") == "assign_player":
+					if multiplayer_player is None:
+						multiplayer_player = move.get("player")
+						print(f"[Multiplayer] Assigned as Player {multiplayer_player}")
+					else:
+						print(f"[Multiplayer] Ignoring duplicate assign_player message.")
+					if move.get("player") == 2:
+						multiplayer_ready = True
+						print("[Multiplayer] Both players connected. Game starting!")
+					# Lock local placement control to this player in multiplayer
+					if multiplayer_mode and multiplayer_player in (1, 2):
+						placement_player = multiplayer_player
+				elif move.get("type") == "board_state":
+					print(f"[Multiplayer] Applying board_state sync")
+					remote_board = move.get("board")
+					remote_round = move.get("round_number", round_number)
+					# Accept current or next-round snapshots; ignore only if remote is way behind
+					if remote_round + 1 < round_number:
+						print(f"[Multiplayer] Ignoring stale board_state (remote round {remote_round} << local {round_number})")
+						continue
+					if isinstance(remote_board, list):
+						board = [list(row) for row in remote_board]
+						initial_board = [row[:] for row in board]
+						last_round_snapshot = [row[:] for row in board]
+						round_number = max(round_number, remote_round)
+						current_round_placements = {1: set(), 2: set()}
+						placement_done = {1: False, 2: False}
+						placements_left = {1: max_placements.get(1, 5), 2: max_placements.get(2, 5)}
+						phase = "placement"
+						evolution_counter = 0
+						winner = 0
+						prev_board = None
+						seen_states = {}
+						# Keep placement control on local player
+						if multiplayer_mode and multiplayer_player in (1, 2):
+							placement_player = multiplayer_player
+						else:
+							placement_player = 1
+				elif move.get("type") == "place_pattern":
+					print(f"[Multiplayer] Applying remote pattern move: {move}")
+					# Only apply if it's not our own move and player is valid
+					if multiplayer_player is not None and move.get("player") != multiplayer_player:
+						pattern = move.get("pattern")
+						rotation = move.get("rotation", 0)
+						x = move.get("x")
+						y = move.get("y")
+						player = move.get("player")
+						if pattern and can_place_pattern(board, rotate_pattern(PATTERNS[pattern], rotation), x, y, player):
+							place_pattern(board, rotate_pattern(PATTERNS[pattern], rotation), x, y, player)
+							for dx, dy in rotate_pattern(PATTERNS[pattern], rotation):
+								current_round_placements[player].add((x + dx, y + dy))
+							placements_left.setdefault(player, max_placements.get(player, 5))
+							placements_left[player] = max(0, placements_left[player] - len(rotate_pattern(PATTERNS[pattern], rotation)))
+							placement_done[player] = placements_left[player] == 0
+							# No turn switching in online simultaneous placement
+							if placement_done[1] and placement_done[2]:
+								for y2 in range(BOARD_HEIGHT):
+									for x2 in range(BOARD_WIDTH):
+										initial_board[y2][x2] = board[y2][x2]
+								round_placements.append({1: current_round_placements[1].copy(), 2: current_round_placements[2].copy()})
+								current_round_placements = {1: set(), 2: set()}
+								placement_done = {1: False, 2: False}
+								phase = "evolution"
+								evolution_counter = 0
+				elif move.get("type") == "place_cell":
+					print(f"[Multiplayer] Applying remote cell move: {move}")
+					if multiplayer_player is not None and move.get("player") != multiplayer_player:
+						x = move.get("x")
+						y = move.get("y")
+						player = move.get("player")
+						if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT and board[y][x] == 0:
+							if player == 1 and x < BOARD_WIDTH // 2:
+								board[y][x] = 1
+								current_round_placements[1].add((x, y))
+							elif player == 2 and x >= BOARD_WIDTH // 2:
+								board[y][x] = 2
+								current_round_placements[2].add((x, y))
+							else:
+								continue
+							placements_left.setdefault(player, max_placements.get(player, 5))
+							placements_left[player] = max(0, placements_left[player] - 1)
+							placement_done[player] = placements_left[player] == 0
+							# No turn switching in online simultaneous placement
+							if placement_done[1] and placement_done[2]:
+								for y2 in range(BOARD_HEIGHT):
+									for x2 in range(BOARD_WIDTH):
+										initial_board[y2][x2] = board[y2][x2]
+								round_placements.append({1: current_round_placements[1].copy(), 2: current_round_placements[2].copy()})
+								current_round_placements = {1: set(), 2: set()}
+								placement_done = {1: False, 2: False}
+								phase = "evolution"
+								evolution_counter = 0
+		# In multiplayer, ensure placement control stays on the local player each frame
+		if multiplayer_mode and multiplayer_player in (1, 2):
+			placement_player = multiplayer_player
+
 		# Calculate scale and offset for centering (always keep aspect, never stretch, always center)
 		board_px_w = BOARD_WIDTH * CELL_SIZE
 		board_px_h = BOARD_HEIGHT * CELL_SIZE
@@ -319,6 +541,22 @@ def main():
 				pygame.display.flip()
 				clock.tick(FPS)
 				for event in pygame.event.get():
+					# --- Multiplayer: connect on lobby start ---
+					if phase == 'menu' and menu_state == 'lobby' and not multiplayer_mode:
+						print("[Multiplayer] Entering lobby menu, starting client...")
+						start_ws_client("ws://localhost:8765")
+						multiplayer_mode = True
+						multiplayer_player = None
+						print("[Multiplayer] Connecting to server...")
+					# --- Multiplayer: assign player number when connected ---
+					if multiplayer_mode and not multiplayer_ready and ws_connected:
+						# Assign player 1 or 2 based on order of connection
+						if multiplayer_player is None:
+							multiplayer_player = 1
+							print("[Multiplayer] You are Player 1. Waiting for Player 2...")
+						elif multiplayer_player == 1:
+							multiplayer_ready = True
+							print("[Multiplayer] Both players connected. Game starting!")
 					if event.type == pygame.QUIT:
 						running = False
 						return
@@ -679,49 +917,66 @@ def main():
 				y = int(y)
 			except Exception:
 				continue
+			# Multiplayer: only allow local placement for your own player slot
+			if multiplayer_mode and multiplayer_player is not None and placement_player != multiplayer_player:
+				continue
 			if event.button == 1:
 				placed = False
 				if selected_pattern:
 					pattern = rotate_pattern(PATTERNS[selected_pattern], pattern_rotation)
 					# Only allow if enough placements left
-					if can_place_pattern(board, pattern, x, y, placement_player) and placements_left >= len(pattern):
+					if can_place_pattern(board, pattern, x, y, placement_player) and placements_left[placement_player] >= len(pattern):
 						place_pattern(board, pattern, x, y, placement_player)
 						for dx, dy in pattern:
 							current_round_placements[placement_player].add((x + dx, y + dy))
-						placements_left -= len(pattern)
+						placements_left[placement_player] -= len(pattern)
 						selected_pattern = None
 						pattern_rotation = 0
-						placed = True
+					placed = True
+					# Multiplayer: send move
+					if multiplayer_mode:
+						if ws_connected.is_set():
+							if selected_pattern is not None:
+								print(f"[Multiplayer] Queuing pattern move: {selected_pattern}, {pattern_rotation}, {x}, {y}, {placement_player}")
+								move = {"type": "place_pattern", "pattern": selected_pattern, "rotation": pattern_rotation, "x": x, "y": y, "player": placement_player}
+								try:
+									ws_send_queue.append(json.dumps(move))
+								except Exception as e:
+									print(f"[Multiplayer] Send error: {e}")
+						else:
+							print("[Multiplayer] Not connected, cannot send pattern move.")
 				else:
 					if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT:
-						if placements_left > 0 and board[y][x] == 0:
+						if placements_left[placement_player] > 0 and board[y][x] == 0:
 							if placement_player == 1 and x < BOARD_WIDTH // 2:
 								board[y][x] = 1
 								current_round_placements[1].add((x, y))
-								placements_left -= 1
+								placements_left[placement_player] -= 1
 								placed = True
 							elif placement_player == 2 and x >= BOARD_WIDTH // 2:
 								board[y][x] = 2
 								current_round_placements[2].add((x, y))
-								placements_left -= 1
+								placements_left[placement_player] -= 1
 								placed = True
-				# If placements are used up after this click, handle turn switching or evolution start
-				if placed and placements_left == 0:
+							# Multiplayer: send move
+							if multiplayer_mode:
+								if ws_connected.is_set():
+									print(f"[Multiplayer] Queuing cell move: {x}, {y}, {placement_player}")
+									move = {"type": "place_cell", "x": x, "y": y, "player": placement_player}
+									try:
+										ws_send_queue.append(json.dumps(move))
+									except Exception as e:
+										print(f"[Multiplayer] Send error: {e}")
+								else:
+									print("[Multiplayer] Not connected, cannot send cell move.")
+				# If placements are used up after this click, mark this player as done
+				if placed and placements_left[placement_player] == 0:
 					placement_done[placement_player] = True
-					if placement_done[1] and placement_done[2]:
-						# Both players placed; start evolution
-						for y2 in range(BOARD_HEIGHT):
-							for x2 in range(BOARD_WIDTH):
-								initial_board[y2][x2] = board[y2][x2]
-						round_placements.append({1: current_round_placements[1].copy(), 2: current_round_placements[2].copy()})
-						current_round_placements = {1: set(), 2: set()}
-						placement_done = {1: False, 2: False}
-						phase = "evolution"
-						evolution_counter = 0
-					else:
-						# Switch to the other player and reset their placements_left
-						placement_player = 2 if placement_player == 1 else 1
-						placements_left = max_placements
+					# In multiplayer, do not switch turns—both players place simultaneously
+					if not multiplayer_mode:
+						if not (placement_done[1] and placement_done[2]):
+							placement_player = 2 if placement_player == 1 else 1
+							placements_left[placement_player] = max_placements[placement_player]
 			elif event.button == 3:
 				# Delete only your own block: if placed this round, refund a placement; otherwise costs 1 placement
 				if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT and board[y][x] == placement_player:
@@ -729,26 +984,30 @@ def main():
 					if placed_this_round:
 						current_round_placements[placement_player].discard((x, y))
 						board[y][x] = 0
-						placements_left = min(max_placements, placements_left + 1)
-					elif placements_left > 0:
+						placements_left[placement_player] = min(max_placements[placement_player], placements_left[placement_player] + 1)
+					elif placements_left[placement_player] > 0:
 						board[y][x] = 0
-						placements_left -= 1
-				if placements_left == 0:
-					placement_done[placement_player] = True
-					if placement_done[1] and placement_done[2]:
-						# Both players placed; start evolution
-						for y2 in range(BOARD_HEIGHT):
-							for x2 in range(BOARD_WIDTH):
-								initial_board[y2][x2] = board[y2][x2]
-						round_placements.append({1: current_round_placements[1].copy(), 2: current_round_placements[2].copy()})
-						current_round_placements = {1: set(), 2: set()}
-						placement_done = {1: False, 2: False}
-						phase = "evolution"
-						evolution_counter = 0
-					else:
-						# Switch to the other player and reset their placements_left
-						placement_player = 2 if placement_player == 1 else 1
-						placements_left = max_placements
+						placements_left[placement_player] -= 1
+					if placements_left[placement_player] == 0:
+						placement_done[placement_player] = True
+						# In multiplayer, do not switch turns—both players place simultaneously
+						if not multiplayer_mode:
+							if not (placement_done[1] and placement_done[2]):
+								placement_player = 2 if placement_player == 1 else 1
+								placements_left[placement_player] = max_placements[placement_player]
+
+		# If both players are done placing, move to evolution (works for multiplayer and hotseat)
+		if phase == "placement" and placement_done[1] and placement_done[2]:
+			# Snapshot this placement state to restore for next round
+			last_round_snapshot = [row[:] for row in board]
+			for y2 in range(BOARD_HEIGHT):
+				for x2 in range(BOARD_WIDTH):
+					initial_board[y2][x2] = board[y2][x2]
+			round_placements.append({1: current_round_placements[1].copy(), 2: current_round_placements[2].copy()})
+			current_round_placements = {1: set(), 2: set()}
+			placement_done = {1: False, 2: False}
+			phase = "evolution"
+			evolution_counter = 0
 
 		if phase == "evolution":
 			if evolution_counter < evolution_steps and winner == 0:
@@ -779,17 +1038,36 @@ def main():
 							for i, (x, y) in enumerate(round_placements[round_number - 5][p]):
 								if i < 5:
 									initial_board[y][x] = 0
-					board = [row[:] for row in initial_board]
-					first_player = 2 if first_player == 1 else 1
+					# Restore board to last placement snapshot for the new round
+					if last_round_snapshot is not None:
+						board = [row[:] for row in last_round_snapshot]
+						initial_board = [row[:] for row in board]
+					else:
+						initial_board = [[0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+						board = [row[:] for row in initial_board]
+					# Do not alternate turns between rounds; keep player 1 as anchor (or the local multiplayer player)
+					first_player = 1
 					player = first_player
-					placement_player = first_player
-					placements_left = max_placements
+					if multiplayer_mode and multiplayer_player in (1, 2):
+						placement_player = multiplayer_player
+					else:
+						placement_player = first_player
+					# Fresh per-player counters for the new round (avoid aliasing)
+					if not isinstance(max_placements, dict):
+						max_placements = {1: max_placements, 2: max_placements}
+					placements_left = {1: max_placements.get(1, 5), 2: max_placements.get(2, 5)}
 					current_round_placements = {1: set(), 2: set()}
 					placement_done = {1: False, 2: False}
 					winner = 0
 					prev_board = None
 					seen_states = {}
 					round_number += 1
+					# Sync board state (placement snapshot) to peers
+					if multiplayer_mode and ws_connected.is_set():
+						try:
+							ws_send_queue.append(json.dumps({"type": "board_state", "board": board, "round_number": round_number}))
+						except Exception as e:
+							print(f"[Multiplayer] Send board_state error: {e}")
 			else:
 				phase = "placement"
 				# Delete up to 5 blocks from each player placed 5 rounds ago
@@ -798,18 +1076,36 @@ def main():
 						for i, (x, y) in enumerate(round_placements[round_number - 5][p]):
 							if i < 5:
 								initial_board[y][x] = 0
-				board = [row[:] for row in initial_board]
-				# Alternate first player each round
-				first_player = 2 if first_player == 1 else 1
+				# Restore board to last placement snapshot for the new round
+				if last_round_snapshot is not None:
+					board = [row[:] for row in last_round_snapshot]
+					initial_board = [row[:] for row in board]
+				else:
+					initial_board = [[0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+					board = [row[:] for row in initial_board]
+				# Do not alternate; keep player 1 anchor (or the local multiplayer player)
+				first_player = 1
 				player = first_player
-				placement_player = first_player
-				placements_left = max_placements
+				if multiplayer_mode and multiplayer_player in (1, 2):
+					placement_player = multiplayer_player
+				else:
+					placement_player = first_player
+				# Fresh per-player counters for the new round (avoid aliasing)
+				if not isinstance(max_placements, dict):
+					max_placements = {1: max_placements, 2: max_placements}
+				placements_left = {1: max_placements.get(1, 5), 2: max_placements.get(2, 5)}
 				current_round_placements = {1: set(), 2: set()}
 				placement_done = {1: False, 2: False}
 				winner = 0
 				prev_board = None
 				seen_states = {}
 				round_number += 1
+				# Sync board state (placement snapshot) to peers
+				if multiplayer_mode and ws_connected.is_set():
+					try:
+						ws_send_queue.append(json.dumps({"type": "board_state", "board": board, "round_number": round_number}))
+					except Exception as e:
+						print(f"[Multiplayer] Send board_state error: {e}")
 
 		# All overlays and placement use scale/offset
 		# Animate score if needed
@@ -837,7 +1133,7 @@ def main():
 			draw_ghost(screen, placement_player, selected_pattern, placements_left, pattern_rotation, scaled_cell, offset_x, offset_y)
 			# Info text above board
 			if show_info_text:
-				info = f"Player {placement_player}'s turn | Placements left: {placements_left}"
+				info = f"Player {placement_player}'s turn | Placements left: {placements_left[placement_player]}"
 				text = font.render(info, True, BLACK)
 				info_rect = text.get_rect(center=(WINDOW_WIDTH//2, offset_y//2 if offset_y > 40 else 20))
 				screen.blit(text, info_rect)
