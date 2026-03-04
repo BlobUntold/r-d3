@@ -6,8 +6,172 @@ import sys
 import asyncio
 import threading
 import websockets
+
+# WebRTC imports
 import json
-import aioconsole
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+########## WebRTC Peer Connection Setup ##########
+webrtc_mode = False  # Set to True to use WebRTC instead of WebSockets
+webrtc_role = None   # 'host' or 'join'
+webrtc_pc = None
+webrtc_channel = None
+webrtc_connected = threading.Event()
+webrtc_initiated = False
+webrtc_channel_open = threading.Event()
+webrtc_loop = None
+webrtc_incoming = []
+webrtc_incoming_lock = threading.Lock()
+
+def setup_webrtc(role):
+	"""
+	Set up aiortc peer connection and data channel for host/join.
+	Manual signaling: copy/paste offer/answer in terminal.
+	"""
+	global webrtc_pc, webrtc_channel, webrtc_role
+	webrtc_role = role
+	config = RTCConfiguration([RTCIceServer(urls=["stun:stun.l.google.com:19302"])] )
+	pc = RTCPeerConnection(configuration=config)
+	channel = None
+
+	def on_open():
+		print("[WebRTC] Data channel open! Multiplayer ready.")
+		webrtc_connected.set()
+		webrtc_channel_open.set()
+		if WEBRTC_DEBUG:
+			state = webrtc_channel.readyState if webrtc_channel else "None"
+			print(f"[WebRTC] Channel readyState={state}")
+		# Send ready signal as soon as channel opens
+		player_id = 1 if webrtc_role == 'host' else 2
+		ready_msg = json.dumps({"type": "webrtc_ready", "player": player_id})
+		try:
+			if webrtc_channel and webrtc_channel.readyState == "open":
+				webrtc_channel.send(ready_msg)
+				if WEBRTC_DEBUG:
+					print(f"[WebRTC] Sent webrtc_ready for player {player_id}")
+		except Exception as e:
+			print(f"[WebRTC] Send webrtc_ready error: {e}")
+
+	def on_message(message):
+		print(f"[WebRTC] Received: {message}")
+		with webrtc_incoming_lock:
+			webrtc_incoming.append(message)
+
+	@pc.on("iceconnectionstatechange")
+	def on_ice_state_change():
+		print(f"[WebRTC] ICE state: {pc.iceConnectionState}")
+
+	@pc.on("connectionstatechange")
+	def on_connection_state_change():
+		print(f"[WebRTC] Connection state: {pc.connectionState}")
+
+	if role == 'host':
+		channel = pc.createDataChannel("game")
+		channel.on("open", on_open)
+		channel.on("message", on_message)
+		channel.on("close", lambda: print("[WebRTC] Data channel closed"))
+	else:
+		@pc.on("datachannel")
+		def on_datachannel(ch):
+			print("[WebRTC] Data channel received (join side)")
+			global webrtc_channel
+			nonlocal channel
+			channel = ch
+			webrtc_channel = ch
+			channel.on("open", on_open)
+			channel.on("message", on_message)
+			channel.on("close", lambda: print("[WebRTC] Data channel closed"))
+			if channel.readyState == "open":
+				on_open()
+
+	webrtc_pc = pc
+	webrtc_channel = channel
+	return pc, channel
+
+async def _wait_for_ice_complete(pc):
+	if pc.iceGatheringState == "complete":
+		return
+
+	ice_complete = asyncio.Event()
+
+	@pc.on("icegatheringstatechange")
+	def on_ice_gathering_state_change():
+		if pc.iceGatheringState == "complete":
+			ice_complete.set()
+
+	await ice_complete.wait()
+
+async def _webrtc_signaling_flow(role):
+	import sys
+	pc, channel = setup_webrtc(role)
+	loop = asyncio.get_running_loop()
+	global webrtc_loop
+	webrtc_loop = loop
+
+	async def keepalive():
+		while True:
+			await asyncio.sleep(5)
+			try:
+				if webrtc_channel and webrtc_channel.readyState == "open":
+					webrtc_channel.send(json.dumps({"type": "webrtc_ping"}))
+			except Exception as e:
+				print(f"[WebRTC] keepalive error: {e}")
+
+	asyncio.create_task(keepalive())
+	if role == 'host':
+		offer = await pc.createOffer()
+		await pc.setLocalDescription(offer)
+		await _wait_for_ice_complete(pc)
+		print("=== COPY THIS OFFER TO THE JOINING PLAYER ===")
+		print(pc.localDescription.sdp)
+		print("=== END OFFER ===\n")
+		print("Paste the answer from the joining player, then press Ctrl-Z then Enter:")
+		answer_sdp = await loop.run_in_executor(None, sys.stdin.read)
+		answer = RTCSessionDescription(sdp=answer_sdp, type="answer")
+		await pc.setRemoteDescription(answer)
+	else:
+		print("Paste the offer from the host, then press Ctrl-Z then Enter:")
+		offer_sdp = await loop.run_in_executor(None, sys.stdin.read)
+		offer = RTCSessionDescription(sdp=offer_sdp, type="offer")
+		await pc.setRemoteDescription(offer)
+		answer = await pc.createAnswer()
+		await pc.setLocalDescription(answer)
+		await _wait_for_ice_complete(pc)
+		print("=== COPY THIS ANSWER TO THE HOST ===")
+		print(pc.localDescription.sdp)
+		print("=== END ANSWER ===\n")
+	print("[WebRTC] Waiting for data channel to open...")
+	await loop.run_in_executor(None, webrtc_connected.wait)
+	print("[WebRTC] Connection established!")
+	# Keep the loop alive so the peer connection stays open
+	await asyncio.Event().wait()
+
+def webrtc_manual_signaling(role):
+	try:
+		asyncio.run(_webrtc_signaling_flow(role))
+	except Exception as e:
+		print(f"[WebRTC] signaling error: {e}")
+
+def start_webrtc_thread(role):
+	thread = threading.Thread(target=webrtc_manual_signaling, args=(role,), daemon=True)
+	thread.start()
+	return thread
+
+def ws_send_webrtc(msg):
+	# Send message over WebRTC data channel
+	if webrtc_channel and webrtc_channel_open.is_set() and webrtc_channel.readyState == "open":
+		if webrtc_loop and not webrtc_loop.is_closed():
+			webrtc_loop.call_soon_threadsafe(webrtc_channel.send, msg)
+			return True
+	print("[WebRTC] Data channel not open!")
+	return False
+
+def ws_receive_webrtc():
+	# Receive messages from ws_queue (pop oldest)
+	if ws_queue:
+		return ws_queue.pop(0)
+	return None
+
+########## END WebRTC Peer Connection Setup ##########
 
 # Game settings
 BOARD_WIDTH = 26
@@ -16,6 +180,8 @@ CELL_SIZE = 20
 WINDOW_WIDTH = BOARD_WIDTH * CELL_SIZE
 WINDOW_HEIGHT = BOARD_HEIGHT * CELL_SIZE
 FPS = 10
+DEBUG = False
+WEBRTC_DEBUG = True
 
 # Colors
 WHITE = (255, 255, 255)
@@ -198,6 +364,7 @@ def reset_game():
 
 def main():
 	print("[DEBUG] main() started")
+	global webrtc_mode, webrtc_initiated, webrtc_role
 	global WINDOW_WIDTH, WINDOW_HEIGHT
 	pygame.init()
 	pygame.key.start_text_input()
@@ -219,9 +386,9 @@ def main():
 	bigfont = pygame.font.SysFont(None, 120)
 
 	# Menu and settings state
-	menu_state = 'main'  # 'main', 'settings', 'local', 'lobby', 'quick', 'game'
+	menu_state = 'main'  # 'main', 'settings', 'local', 'lobby', 'quick', 'game', 'webrtc_wait'
 	menu_selected = 0
-	menu_options = ['Local', 'Lobby', 'Quick Match', 'Settings', 'Quit']
+	menu_options = ['Local', 'Lobby', 'WebRTC Host', 'WebRTC Join', 'Quick Match', 'Settings', 'Quit']
 	settings = {'win_score': 3, 'board_width': 26, 'board_height': 30, 'show_text': True}
 	settings_fields = ['show_text']
 	settings_labels = ['Show Info Text']
@@ -339,6 +506,7 @@ def main():
 				placement_player = multiplayer_player
 
 	def request_start_match(reset_score=True):
+		nonlocal menu_state
 		if multiplayer_mode:
 			if multiplayer_player == 1 and multiplayer_ready:
 				try:
@@ -346,6 +514,8 @@ def main():
 				except Exception as e:
 					print(f"[Multiplayer] Send start_match error: {e}")
 				start_match(reset_score=reset_score)
+				if webrtc_mode:
+					menu_state = 'game'
 			return
 		start_match(reset_score=reset_score)
 
@@ -366,12 +536,12 @@ def main():
 	winner_selected = 0  # 0: Play Again, 1: Return Home
 	ignore_mouse_until_up = False
 	suppress_next_placement = False
-	# --- Multiplayer state ---
 
+	# --- Multiplayer state ---
 	ws = None
 	ws_thread = None
-	ws_queue = []  # List of received messages
-	ws_send_queue = []  # List of outgoing messages
+	ws_queue = []  # List of received messages (used for both WebSocket and WebRTC)
+	ws_send_queue = []  # List of outgoing messages (WebSocket only)
 	ws_connected = threading.Event()
 	ws_stop = threading.Event()
 
@@ -424,17 +594,19 @@ def main():
 	multiplayer_ready = False
 	multiplayer_player = None  # 1 or 2
 	ready_players = set()
+	webrtc_ready_players = set()
 	play_again_ready = set()
 	# ...existing code...
 	while running:
 		# Throttle debug print to every 2 seconds
-		import time
-		if not hasattr(main, "_last_debug"):
-			main._last_debug = 0
-		now = time.time()
-		if now - main._last_debug > 2:
-			print(f"[DEBUG] Loop: phase={phase}, menu_state={menu_state}, multiplayer_mode={multiplayer_mode}")
-			main._last_debug = now
+		if DEBUG:
+			import time
+			if not hasattr(main, "_last_debug"):
+				main._last_debug = 0
+			now = time.time()
+			if now - main._last_debug > 2:
+				print(f"[DEBUG] Loop: phase={phase}, menu_state={menu_state}, multiplayer_mode={multiplayer_mode}")
+				main._last_debug = now
 		# --- Multiplayer: connect on lobby start (robust) ---
 		if menu_state == 'lobby' and not multiplayer_mode:
 			print("[Multiplayer] Entering lobby menu, starting client...")
@@ -443,6 +615,41 @@ def main():
 			multiplayer_player = None
 			multiplayer_ready = False
 			print("[Multiplayer] Connecting to server...")
+		# --- WebRTC: connect on menu selection (non-blocking) ---
+		if menu_state == 'webrtc_host' and not webrtc_initiated:
+			print("[WebRTC] Selected Host. Starting manual signaling...")
+			webrtc_mode = True
+			webrtc_initiated = True
+			start_webrtc_thread('host')
+			menu_state = 'webrtc_wait'
+		if menu_state == 'webrtc_join' and not webrtc_initiated:
+			print("[WebRTC] Selected Join. Starting manual signaling...")
+			webrtc_mode = True
+			webrtc_initiated = True
+			start_webrtc_thread('join')
+			menu_state = 'webrtc_wait'
+		# --- WebRTC: finalize multiplayer state once connected ---
+		if webrtc_mode and webrtc_channel_open.is_set() and not multiplayer_mode:
+			multiplayer_mode = True
+			multiplayer_player = 1 if webrtc_role == 'host' else 2
+			multiplayer_ready = True
+			ws_connected.set()
+			ready_players.add(multiplayer_player)
+			webrtc_ready_players.add(multiplayer_player)
+			if WEBRTC_DEBUG:
+				print(f"[WebRTC] multiplayer_mode set. role={webrtc_role}, player={multiplayer_player}")
+			menu_state = 'webrtc_wait'
+		# --- WebRTC: flush send queue via data channel ---
+		if webrtc_mode and webrtc_channel_open.is_set() and ws_send_queue:
+			while ws_send_queue:
+				if not ws_send_webrtc(ws_send_queue[0]):
+					break
+				ws_send_queue.pop(0)
+		# --- WebRTC: merge incoming messages into ws_queue ---
+		if webrtc_mode and webrtc_incoming:
+			with webrtc_incoming_lock:
+				ws_queue.extend(webrtc_incoming)
+				webrtc_incoming.clear()
 		# --- Multiplayer: process received moves ---
 		if multiplayer_mode and ws_queue:
 			while ws_queue:
@@ -477,6 +684,16 @@ def main():
 						if ready_players == {1, 2}:
 							multiplayer_ready = True
 							print("[Multiplayer] Both players ready. Host can start.")
+				elif move.get("type") == "webrtc_ready":
+					player_num = move.get("player")
+					if player_num in (1, 2):
+						webrtc_ready_players.add(player_num)
+						if WEBRTC_DEBUG:
+							print(f"[WebRTC] webrtc_ready from player {player_num}; set={webrtc_ready_players}")
+						if webrtc_ready_players == {1, 2} and multiplayer_player == 1:
+							if WEBRTC_DEBUG:
+								print("[WebRTC] Both ready; host sending start_match")
+							request_start_match(reset_score=True)
 				elif move.get("type") == "play_again_ready":
 					player_num = move.get("player")
 					if player_num in (1, 2):
@@ -606,6 +823,9 @@ def main():
 					reset_score = move.get("reset_score", True)
 					play_again_ready = set()
 					start_match(reset_score=reset_score)
+					if WEBRTC_DEBUG:
+						print("[WebRTC] start_match received; switching to game state")
+					menu_state = 'game'
 			# In multiplayer, ensure placement control stays on the local player each frame
 			if multiplayer_mode and multiplayer_player in (1, 2):
 				placement_player = multiplayer_player
@@ -747,6 +967,10 @@ def main():
 									menu_state = 'lobby'
 									setup_selected = 0
 									setup_input = ''
+								elif opt == 'WebRTC Host':
+									menu_state = 'webrtc_host'
+								elif opt == 'WebRTC Join':
+									menu_state = 'webrtc_join'
 								elif opt == 'Quick Match':
 									start_match()
 								break
@@ -771,6 +995,10 @@ def main():
 								menu_state = 'lobby'
 								setup_selected = 0
 								setup_input = ''
+							elif opt == 'WebRTC Host':
+								menu_state = 'webrtc_host'
+							elif opt == 'WebRTC Join':
+								menu_state = 'webrtc_join'
 							elif opt == 'Quick Match':
 								request_start_match(reset_score=True)
 				elif menu_state == 'settings':
@@ -865,6 +1093,14 @@ def main():
 									setup_selected = i
 									setup_input = ''
 								break
+				elif menu_state == 'webrtc_wait':
+					if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+						webrtc_mode = False
+						webrtc_initiated = False
+						webrtc_connected.clear()
+						webrtc_channel_open.clear()
+						webrtc_role = None
+						menu_state = 'main'
 				# Don't process further if in menu
 				continue
 			# --- END MENU HANDLING ---
@@ -971,6 +1207,19 @@ def main():
 					local_rects.append(rect)
 				info = small_font.render("Enter value, Enter/Click=Start, Esc=Back", True, (80, 80, 80))
 				screen.blit(info, (WINDOW_WIDTH//2 - 200, 140 + len(setup_fields)*50))
+			elif menu_state == 'webrtc_wait':
+				title = menu_font.render("WebRTC Setup", True, (0, 80, 160))
+				title_rect = title.get_rect(center=(WINDOW_WIDTH//2, 60))
+				screen.blit(title, title_rect)
+				info_lines = [
+					"Use the terminal to copy/paste the offer/answer.",
+					"Waiting for data channel to open...",
+					"Press Esc to cancel.",
+				]
+				for i, line in enumerate(info_lines):
+					surf = small_font.render(line, True, (60, 60, 60))
+					rect = surf.get_rect(center=(WINDOW_WIDTH//2, 140 + i*30))
+					screen.blit(surf, rect)
 			pygame.display.flip()
 			clock.tick(FPS)
 			continue
