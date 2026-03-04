@@ -251,6 +251,7 @@ def main():
 		'color': (255, 215, 0),
 		'team': 0
 	}
+	sync_timer = 0
 	SCORE_ANIM_DURATION = 32
 	SCORE_ANIM_SCALE = 2.0
 	SCORE_ANIM_FADE = 10
@@ -291,10 +292,13 @@ def main():
 	placement_done = {1: False, 2: False}
 	prev_points = {1: 0, 2: 0}
 	last_round_snapshot = None
+	placement_delay_timer = 0
+	PLACEMENT_DELAY_FRAMES = FPS * 2  # 2 seconds delay
 
 	def start_match(reset_score=True):
 		nonlocal board, initial_board, round_placements, round_number, player, first_player, placement_player, placements_left, max_placements
 		nonlocal current_round_placements, placement_done, selected_pattern, pattern_rotation, prev_board, seen_states, deleted_blocks_ghost, winner, phase, points
+		nonlocal play_again_ready, last_round_snapshot
 		board, initial_board, round_placements, round_number, player, first_player, placement_player, placements_left, max_placements = reset_game()
 		if not isinstance(placements_left, dict):
 			placements_left = {1: placements_left, 2: placements_left}
@@ -308,6 +312,8 @@ def main():
 		screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.RESIZABLE)
 		current_round_placements = {1: set(), 2: set()}
 		placement_done = {1: False, 2: False}
+		play_again_ready = set()
+		last_round_snapshot = [row[:] for row in board]
 		selected_pattern = PATTERN_KEYS[0]
 		pattern_rotation = 0
 		prev_board = None
@@ -315,10 +321,44 @@ def main():
 		deleted_blocks_ghost = set()
 		winner = 0
 		phase = 'placement'
+		placement_delay_timer = PLACEMENT_DELAY_FRAMES
 		nonlocal match_winner
 		match_winner = 0
 		if reset_score:
 			points = {1: 0, 2: 0}
+		# Broadcast empty board state in multiplayer so both clients reset
+		if multiplayer_mode and ws_connected.is_set() and multiplayer_player == 1:
+			try:
+				ws_send_queue.append(json.dumps({"type": "board_state", "board": board, "round_number": 1}))
+			except Exception as e:
+				print(f"[Multiplayer] Send board_state error (reset): {e}")
+			# Ensure host is ready to process placements
+			if multiplayer_player in (1, 2):
+				placement_player = multiplayer_player
+
+	def request_start_match(reset_score=True):
+		if multiplayer_mode:
+			if multiplayer_player == 1 and multiplayer_ready:
+				try:
+					ws_send_queue.append(json.dumps({"type": "start_match", "reset_score": reset_score}))
+				except Exception as e:
+					print(f"[Multiplayer] Send start_match error: {e}")
+				start_match(reset_score=reset_score)
+			return
+		start_match(reset_score=reset_score)
+
+	def request_play_again():
+		if multiplayer_mode:
+			if multiplayer_player in (1, 2):
+				play_again_ready.add(multiplayer_player)
+				try:
+					ws_send_queue.append(json.dumps({"type": "play_again_ready", "player": multiplayer_player}))
+				except Exception as e:
+					print(f"[Multiplayer] Send play_again_ready error: {e}")
+				if multiplayer_player == 1 and multiplayer_ready and play_again_ready == {1, 2}:
+					request_start_match(reset_score=True)
+			return
+		start_match(reset_score=True)
 
 	# Track selection for winner screen
 	winner_selected = 0  # 0: Play Again, 1: Return Home
@@ -381,6 +421,8 @@ def main():
 	multiplayer_mode = False
 	multiplayer_ready = False
 	multiplayer_player = None  # 1 or 2
+	ready_players = set()
+	play_again_ready = set()
 	# ...existing code...
 	while running:
 		# Throttle debug print to every 2 seconds
@@ -415,12 +457,30 @@ def main():
 						print(f"[Multiplayer] Assigned as Player {multiplayer_player}")
 					else:
 						print(f"[Multiplayer] Ignoring duplicate assign_player message.")
-					if move.get("player") == 2:
-						multiplayer_ready = True
-						print("[Multiplayer] Both players connected. Game starting!")
+					# Mark local player as ready (server does not echo to sender)
+					if multiplayer_player in (1, 2):
+						ready_players.add(multiplayer_player)
+					if ws_connected.is_set():
+						try:
+							ws_send_queue.append(json.dumps({"type": "player_ready", "player": multiplayer_player}))
+						except Exception as e:
+							print(f"[Multiplayer] Send player_ready error: {e}")
 					# Lock local placement control to this player in multiplayer
 					if multiplayer_mode and multiplayer_player in (1, 2):
 						placement_player = multiplayer_player
+				elif move.get("type") == "player_ready":
+					player_num = move.get("player")
+					if player_num in (1, 2):
+						ready_players.add(player_num)
+						if ready_players == {1, 2}:
+							multiplayer_ready = True
+							print("[Multiplayer] Both players ready. Host can start.")
+				elif move.get("type") == "play_again_ready":
+					player_num = move.get("player")
+					if player_num in (1, 2):
+						play_again_ready.add(player_num)
+						if multiplayer_player == 1 and play_again_ready == {1, 2}:
+							request_start_match(reset_score=True)
 				elif move.get("type") == "board_state":
 					print(f"[Multiplayer] Applying board_state sync")
 					remote_board = move.get("board")
@@ -429,24 +489,29 @@ def main():
 					if remote_round + 1 < round_number:
 						print(f"[Multiplayer] Ignoring stale board_state (remote round {remote_round} << local {round_number})")
 						continue
+					# Only apply board state if it's a reset (empty board and round 1), or if remote_round > local round_number
 					if isinstance(remote_board, list):
-						board = [list(row) for row in remote_board]
-						initial_board = [row[:] for row in board]
-						last_round_snapshot = [row[:] for row in board]
-						round_number = max(round_number, remote_round)
-						current_round_placements = {1: set(), 2: set()}
-						placement_done = {1: False, 2: False}
-						placements_left = {1: max_placements.get(1, 5), 2: max_placements.get(2, 5)}
-						phase = "placement"
-						evolution_counter = 0
-						winner = 0
-						prev_board = None
-						seen_states = {}
-						# Keep placement control on local player
-						if multiplayer_mode and multiplayer_player in (1, 2):
-							placement_player = multiplayer_player
-						else:
-							placement_player = 1
+						is_reset = all(cell == 0 for row in remote_board for cell in row) and remote_round == 1
+						if is_reset or remote_round > round_number:
+							board = [list(row) for row in remote_board]
+							initial_board = [row[:] for row in board]
+							last_round_snapshot = [row[:] for row in board]
+							round_number = remote_round
+							current_round_placements = {1: set(), 2: set()}
+							placement_done = {1: False, 2: False}
+							placements_left = {1: max_placements.get(1, 5), 2: max_placements.get(2, 5)}
+							phase = "placement"
+							evolution_counter = 0
+							winner = 0
+							prev_board = None
+							seen_states = {}
+							if is_reset:
+								round_placements = []
+							# Keep placement control on local player
+							if multiplayer_mode and multiplayer_player in (1, 2):
+								placement_player = multiplayer_player
+							else:
+								placement_player = 1
 				elif move.get("type") == "place_pattern":
 					print(f"[Multiplayer] Applying remote pattern move: {move}")
 					# Only apply if it's not our own move and player is valid
@@ -456,6 +521,7 @@ def main():
 						x = move.get("x")
 						y = move.get("y")
 						player = move.get("player")
+						# Accept remote placements anywhere within bounds
 						if pattern and can_place_pattern(board, rotate_pattern(PATTERNS[pattern], rotation), x, y, player):
 							place_pattern(board, rotate_pattern(PATTERNS[pattern], rotation), x, y, player)
 							for dx, dy in rotate_pattern(PATTERNS[pattern], rotation):
@@ -464,15 +530,6 @@ def main():
 							placements_left[player] = max(0, placements_left[player] - len(rotate_pattern(PATTERNS[pattern], rotation)))
 							placement_done[player] = placements_left[player] == 0
 							# No turn switching in online simultaneous placement
-							if placement_done[1] and placement_done[2]:
-								for y2 in range(BOARD_HEIGHT):
-									for x2 in range(BOARD_WIDTH):
-										initial_board[y2][x2] = board[y2][x2]
-								round_placements.append({1: current_round_placements[1].copy(), 2: current_round_placements[2].copy()})
-								current_round_placements = {1: set(), 2: set()}
-								placement_done = {1: False, 2: False}
-								phase = "evolution"
-								evolution_counter = 0
 				elif move.get("type") == "place_cell":
 					print(f"[Multiplayer] Applying remote cell move: {move}")
 					if multiplayer_player is not None and move.get("player") != multiplayer_player:
@@ -480,19 +537,15 @@ def main():
 						y = move.get("y")
 						player = move.get("player")
 						if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT and board[y][x] == 0:
-							if player == 1 and x < BOARD_WIDTH // 2:
-								board[y][x] = 1
-								current_round_placements[1].add((x, y))
-							elif player == 2 and x >= BOARD_WIDTH // 2:
-								board[y][x] = 2
-								current_round_placements[2].add((x, y))
-							else:
-								continue
+							# Accept remote placements anywhere within bounds
+							board[y][x] = player
+							current_round_placements[player].add((x, y))
 							placements_left.setdefault(player, max_placements.get(player, 5))
 							placements_left[player] = max(0, placements_left[player] - 1)
 							placement_done[player] = placements_left[player] == 0
 							# No turn switching in online simultaneous placement
 							if placement_done[1] and placement_done[2]:
+								last_round_snapshot = [row[:] for row in board]
 								for y2 in range(BOARD_HEIGHT):
 									for x2 in range(BOARD_WIDTH):
 										initial_board[y2][x2] = board[y2][x2]
@@ -501,9 +554,44 @@ def main():
 								placement_done = {1: False, 2: False}
 								phase = "evolution"
 								evolution_counter = 0
-		# In multiplayer, ensure placement control stays on the local player each frame
-		if multiplayer_mode and multiplayer_player in (1, 2):
-			placement_player = multiplayer_player
+				elif move.get("type") == "delete_cell":
+					print(f"[Multiplayer] Applying remote delete move: {move}")
+					if multiplayer_player is not None and move.get("player") != multiplayer_player:
+						x = move.get("x")
+						y = move.get("y")
+						player = move.get("player")
+						refund = move.get("refund", False)
+						if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT and board[y][x] == player:
+							board[y][x] = 0
+							current_round_placements[player].discard((x, y))
+							placements_left.setdefault(player, max_placements.get(player, 5))
+							if refund:
+								placements_left[player] = min(max_placements.get(player, 5), placements_left[player] + 1)
+							else:
+								placements_left[player] = max(0, placements_left[player] - 1)
+							placement_done[player] = placements_left[player] == 0
+				elif move.get("type") == "start_evolution":
+					print(f"[Multiplayer] Applying start_evolution: {move}")
+					phase = "evolution"
+					evolution_counter = 0
+					if placement_done[1] and placement_done[2]:
+						last_round_snapshot = [row[:] for row in board]
+						for y2 in range(BOARD_HEIGHT):
+							for x2 in range(BOARD_WIDTH):
+								initial_board[y2][x2] = board[y2][x2]
+						round_placements.append({1: current_round_placements[1].copy(), 2: current_round_placements[2].copy()})
+						current_round_placements = {1: set(), 2: set()}
+						placement_done = {1: False, 2: False}
+						phase = "evolution"
+						evolution_counter = 0
+				elif move.get("type") == "start_match":
+					print(f"[Multiplayer] Applying start_match: {move}")
+					reset_score = move.get("reset_score", True)
+					play_again_ready = set()
+					start_match(reset_score=reset_score)
+			# In multiplayer, ensure placement control stays on the local player each frame
+			if multiplayer_mode and multiplayer_player in (1, 2):
+				placement_player = multiplayer_player
 
 		# Calculate scale and offset for centering (always keep aspect, never stretch, always center)
 		board_px_w = BOARD_WIDTH * CELL_SIZE
@@ -540,6 +628,9 @@ def main():
 				screen.blit(home_surf, home_surf.get_rect(center=home_rect.center))
 				pygame.display.flip()
 				clock.tick(FPS)
+				# Handle placement delay timer
+				if phase == "placement" and placement_delay_timer > 0:
+					placement_delay_timer -= 1
 				for event in pygame.event.get():
 					# --- Multiplayer: connect on lobby start ---
 					if phase == 'menu' and menu_state == 'lobby' and not multiplayer_mode:
@@ -548,15 +639,6 @@ def main():
 						multiplayer_mode = True
 						multiplayer_player = None
 						print("[Multiplayer] Connecting to server...")
-					# --- Multiplayer: assign player number when connected ---
-					if multiplayer_mode and not multiplayer_ready and ws_connected:
-						# Assign player 1 or 2 based on order of connection
-						if multiplayer_player is None:
-							multiplayer_player = 1
-							print("[Multiplayer] You are Player 1. Waiting for Player 2...")
-						elif multiplayer_player == 1:
-							multiplayer_ready = True
-							print("[Multiplayer] Both players connected. Game starting!")
 					if event.type == pygame.QUIT:
 						running = False
 						return
@@ -565,14 +647,14 @@ def main():
 							winner_selected = 1 - winner_selected
 						elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
 							if winner_selected == 0:
-								match_winner = 0
-								start_match(reset_score=True)
+								request_play_again()
 								flush_events = True
 								winner_handled = True
 								break
 							else:
 								match_winner = 0
-								start_match(reset_score=True)
+								if not multiplayer_mode:
+									start_match(reset_score=True)
 								menu_state = 'main'
 								phase = 'menu'
 								flush_events = True
@@ -580,7 +662,8 @@ def main():
 								break
 						elif event.key == pygame.K_ESCAPE:
 							match_winner = 0
-							start_match(reset_score=True)
+							if not multiplayer_mode:
+								start_match(reset_score=True)
 							menu_state = 'main'
 							phase = 'menu'
 							flush_events = True
@@ -589,14 +672,14 @@ def main():
 					elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
 						mx, my = event.pos
 						if play_again_rect.collidepoint(mx, my):
-							match_winner = 0
-							start_match(reset_score=True)
+							request_play_again()
 							flush_events = True
 							winner_handled = True
 							break
 						elif home_rect.collidepoint(mx, my):
 							match_winner = 0
-							start_match(reset_score=True)
+							if not multiplayer_mode:
+								start_match(reset_score=True)
 							menu_state = 'main'
 							phase = 'menu'
 							flush_events = True
@@ -672,7 +755,7 @@ def main():
 								setup_selected = 0
 								setup_input = ''
 							elif opt == 'Quick Match':
-								start_match()
+								request_start_match(reset_score=True)
 				elif menu_state == 'settings':
 					if event.type == pygame.KEYDOWN:
 						if event.key == pygame.K_UP:
@@ -726,7 +809,7 @@ def main():
 									except ValueError:
 										pass
 									setup_input = ''
-								start_match()
+								request_start_match(reset_score=True)
 							elif setup_input:
 								try:
 									val = int(setup_input)
@@ -760,7 +843,7 @@ def main():
 										except ValueError:
 											pass
 										setup_input = ''
-									start_match()
+									request_start_match(reset_score=True)
 								else:
 									setup_selected = i
 									setup_input = ''
@@ -906,6 +989,8 @@ def main():
 			elif text == 'r' and selected_pattern:
 				pattern_rotation = (pattern_rotation + 1) % 4
 		elif phase == "placement" and event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+			if placement_delay_timer > 0:
+				continue  # Block placement until delay expires
 			if suppress_next_placement:
 				suppress_next_placement = False
 				continue
@@ -923,41 +1008,41 @@ def main():
 			if event.button == 1:
 				placed = False
 				if selected_pattern:
-					pattern = rotate_pattern(PATTERNS[selected_pattern], pattern_rotation)
+					pattern_name = selected_pattern
+					pattern_rot = pattern_rotation
+					pattern = rotate_pattern(PATTERNS[pattern_name], pattern_rot)
 					# Only allow if enough placements left
 					if can_place_pattern(board, pattern, x, y, placement_player) and placements_left[placement_player] >= len(pattern):
 						place_pattern(board, pattern, x, y, placement_player)
 						for dx, dy in pattern:
 							current_round_placements[placement_player].add((x + dx, y + dy))
 						placements_left[placement_player] -= len(pattern)
-						selected_pattern = None
-						pattern_rotation = 0
-					placed = True
-					# Multiplayer: send move
-					if multiplayer_mode:
-						if ws_connected.is_set():
-							if selected_pattern is not None:
-								print(f"[Multiplayer] Queuing pattern move: {selected_pattern}, {pattern_rotation}, {x}, {y}, {placement_player}")
-								move = {"type": "place_pattern", "pattern": selected_pattern, "rotation": pattern_rotation, "x": x, "y": y, "player": placement_player}
+						placed = True
+						# Multiplayer: send move
+						if multiplayer_mode:
+							if ws_connected.is_set():
+								print(f"[Multiplayer] Queuing pattern move: {pattern_name}, {pattern_rot}, {x}, {y}, {placement_player}")
+								move = {"type": "place_pattern", "pattern": pattern_name, "rotation": pattern_rot, "x": x, "y": y, "player": placement_player}
 								try:
 									ws_send_queue.append(json.dumps(move))
 								except Exception as e:
 									print(f"[Multiplayer] Send error: {e}")
-						else:
-							print("[Multiplayer] Not connected, cannot send pattern move.")
+							else:
+								print("[Multiplayer] Not connected, cannot send pattern move.")
+						selected_pattern = None
+						pattern_rotation = 0
 				else:
 					if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT:
+						# Only allow placement on your own side
+						if placement_player == 1 and x >= BOARD_WIDTH // 2:
+							continue
+						if placement_player == 2 and x < BOARD_WIDTH // 2:
+							continue
 						if placements_left[placement_player] > 0 and board[y][x] == 0:
-							if placement_player == 1 and x < BOARD_WIDTH // 2:
-								board[y][x] = 1
-								current_round_placements[1].add((x, y))
-								placements_left[placement_player] -= 1
-								placed = True
-							elif placement_player == 2 and x >= BOARD_WIDTH // 2:
-								board[y][x] = 2
-								current_round_placements[2].add((x, y))
-								placements_left[placement_player] -= 1
-								placed = True
+							board[y][x] = placement_player
+							current_round_placements[placement_player].add((x, y))
+							placements_left[placement_player] -= 1
+							placed = True
 							# Multiplayer: send move
 							if multiplayer_mode:
 								if ws_connected.is_set():
@@ -985,9 +1070,23 @@ def main():
 						current_round_placements[placement_player].discard((x, y))
 						board[y][x] = 0
 						placements_left[placement_player] = min(max_placements[placement_player], placements_left[placement_player] + 1)
+						# Multiplayer: send delete with refund
+						if multiplayer_mode and ws_connected.is_set():
+							move = {"type": "delete_cell", "x": x, "y": y, "player": placement_player, "refund": True}
+							try:
+								ws_send_queue.append(json.dumps(move))
+							except Exception as e:
+								print(f"[Multiplayer] Send delete error: {e}")
 					elif placements_left[placement_player] > 0:
 						board[y][x] = 0
 						placements_left[placement_player] -= 1
+						# Multiplayer: send delete with cost
+						if multiplayer_mode and ws_connected.is_set():
+							move = {"type": "delete_cell", "x": x, "y": y, "player": placement_player, "refund": False}
+							try:
+								ws_send_queue.append(json.dumps(move))
+							except Exception as e:
+								print(f"[Multiplayer] Send delete error: {e}")
 					if placements_left[placement_player] == 0:
 						placement_done[placement_player] = True
 						# In multiplayer, do not switch turns—both players place simultaneously
@@ -996,7 +1095,7 @@ def main():
 								placement_player = 2 if placement_player == 1 else 1
 								placements_left[placement_player] = max_placements[placement_player]
 
-		# If both players are done placing, move to evolution (works for multiplayer and hotseat)
+		# If both players are done placing, snapshot and broadcast start_evolution so both screens advance together
 		if phase == "placement" and placement_done[1] and placement_done[2]:
 			# Snapshot this placement state to restore for next round
 			last_round_snapshot = [row[:] for row in board]
@@ -1006,6 +1105,16 @@ def main():
 			round_placements.append({1: current_round_placements[1].copy(), 2: current_round_placements[2].copy()})
 			current_round_placements = {1: set(), 2: set()}
 			placement_done = {1: False, 2: False}
+			# Broadcast board_state then start_evolution so both clients transition
+			if multiplayer_mode and ws_connected.is_set():
+				try:
+					ws_send_queue.append(json.dumps({"type": "board_state", "board": board, "round_number": round_number}))
+				except Exception as e:
+					print(f"[Multiplayer] Send board_state error: {e}")
+				try:
+					ws_send_queue.append(json.dumps({"type": "start_evolution", "round_number": round_number}))
+				except Exception as e:
+					print(f"[Multiplayer] Send start_evolution error: {e}")
 			phase = "evolution"
 			evolution_counter = 0
 
@@ -1183,7 +1292,7 @@ def main():
 					running = False
 				elif event.type == pygame.KEYDOWN:
 					if event.key in (pygame.K_RETURN, pygame.K_SPACE):
-						start_match()
+						request_play_again()
 						break
 					elif event.key == pygame.K_ESCAPE:
 						menu_state = 'main'
@@ -1192,7 +1301,7 @@ def main():
 				elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
 					mx, my = event.pos
 					if play_again_rect.collidepoint(mx, my):
-						start_match()
+						request_play_again()
 						break
 					elif home_rect.collidepoint(mx, my):
 						menu_state = 'main'
@@ -1224,6 +1333,7 @@ def main():
 				# Check if this win ends the match
 				if points[winner] >= settings['win_score']:
 					match_winner = winner
+					play_again_ready = set()
 			else:
 				evo_text = font.render(f"Evolution step {evolution_counter}/{evolution_steps}", True, BLACK)
 				screen.blit(evo_text, (10, 10))
