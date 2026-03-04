@@ -291,6 +291,7 @@ def main():
 	current_round_placements = {1: set(), 2: set()}
 	placement_done = {1: False, 2: False}
 	prev_points = {1: 0, 2: 0}
+	scored_rounds = set()
 	last_round_snapshot = None
 	placement_delay_timer = 0
 	PLACEMENT_DELAY_FRAMES = FPS * 2  # 2 seconds delay
@@ -298,7 +299,7 @@ def main():
 	def start_match(reset_score=True):
 		nonlocal board, initial_board, round_placements, round_number, player, first_player, placement_player, placements_left, max_placements
 		nonlocal current_round_placements, placement_done, selected_pattern, pattern_rotation, prev_board, seen_states, deleted_blocks_ghost, winner, phase, points
-		nonlocal play_again_ready, last_round_snapshot
+		nonlocal play_again_ready, last_round_snapshot, scored_rounds
 		board, initial_board, round_placements, round_number, player, first_player, placement_player, placements_left, max_placements = reset_game()
 		if not isinstance(placements_left, dict):
 			placements_left = {1: placements_left, 2: placements_left}
@@ -313,6 +314,7 @@ def main():
 		current_round_placements = {1: set(), 2: set()}
 		placement_done = {1: False, 2: False}
 		play_again_ready = set()
+		scored_rounds = set()
 		last_round_snapshot = [row[:] for row in board]
 		selected_pattern = PATTERN_KEYS[0]
 		pattern_rotation = 0
@@ -481,6 +483,21 @@ def main():
 						play_again_ready.add(player_num)
 						if multiplayer_player == 1 and play_again_ready == {1, 2}:
 							request_start_match(reset_score=True)
+				elif move.get("type") == "win_event":
+					win_round = move.get("round_number")
+					win_player = move.get("winner")
+					if win_round == round_number and win_player in (1, 2) and win_round not in scored_rounds:
+						winner = win_player
+						points[winner] += 1
+						scored_rounds.add(win_round)
+						# Trigger center score animation
+						score_anim['active'] = True
+						score_anim['timer'] = SCORE_ANIM_DURATION
+						score_anim['scale'] = SCORE_ANIM_SCALE
+						score_anim['alpha'] = 255
+						score_anim['team'] = winner
+						score_anim['color'] = PLAYER1_COLOR if winner == 1 else PLAYER2_COLOR
+						evolution_counter = evolution_steps
 				elif move.get("type") == "board_state":
 					print(f"[Multiplayer] Applying board_state sync")
 					remote_board = move.get("board")
@@ -1130,7 +1147,14 @@ def main():
 				prev_board = [row[:] for row in board]
 				board = next_board
 				if winner:
-					points[winner] += 1
+					if multiplayer_mode and ws_connected.is_set() and round_number not in scored_rounds:
+						try:
+							ws_send_queue.append(json.dumps({"type": "win_event", "winner": winner, "round_number": round_number}))
+						except Exception as e:
+							print(f"[Multiplayer] Send win_event error: {e}")
+					if round_number not in scored_rounds:
+						points[winner] += 1
+						scored_rounds.add(round_number)
 					# Trigger center score animation
 					score_anim['active'] = True
 					score_anim['timer'] = SCORE_ANIM_DURATION
