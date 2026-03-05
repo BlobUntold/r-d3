@@ -25,6 +25,7 @@ webrtc_channel_open = threading.Event()
 webrtc_loop = None
 webrtc_incoming = []
 webrtc_incoming_lock = threading.Lock()
+webrtc_settings_synced = False  # Set True on join side when settings_sync received
 
 def setup_webrtc(role):
 	"""
@@ -459,8 +460,10 @@ def reset_game():
 
 def main():
 	print("[DEBUG] main() started")
-	global webrtc_mode, webrtc_initiated, webrtc_role
-	global WINDOW_WIDTH, WINDOW_HEIGHT
+	global webrtc_mode, webrtc_initiated, webrtc_role, webrtc_settings_synced
+	global WINDOW_WIDTH, WINDOW_HEIGHT, BOARD_WIDTH, BOARD_HEIGHT
+	BOARD_WIDTH = 26
+	BOARD_HEIGHT = 30
 	pygame.init()
 	pygame.key.start_text_input()
 	screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.RESIZABLE)
@@ -484,6 +487,10 @@ def main():
 	menu_state = 'main'  # 'main', 'settings', 'local', 'lobby', 'quick', 'game', 'webrtc_wait'
 	menu_selected = 0
 	menu_options = ['Local', 'Lobby', 'WebRTC Host', 'WebRTC Join', 'Quick Match', 'Settings', 'Quit']
+	webrtc_settings_fields = ['board_width', 'board_height', 'win_score']
+	webrtc_settings_labels = ['Board Width (even)', 'Board Height', 'Win Score']
+	webrtc_settings_selected = 0
+	webrtc_settings_input = ''
 	settings = {'win_score': 3, 'board_width': 26, 'board_height': 30, 'show_text': True}
 	settings_fields = ['show_text']
 	settings_labels = ['Show Info Text']
@@ -691,7 +698,6 @@ def main():
 	ready_players = set()
 	webrtc_ready_players = set()
 	play_again_ready = set()
-	# ...existing code...
 	while running:
 		# Throttle debug print to every 2 seconds
 		if DEBUG:
@@ -716,50 +722,112 @@ def main():
 			# Generate code and show to host
 			if 'webrtc_room_code' not in globals():
 				webrtc_room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-			menu_state = 'webrtc_code_host'
+			menu_state = 'webrtc_settings'
 			webrtc_code_confirmed = False
-		if menu_state == 'webrtc_code_host':
-			# Draw host code entry UI with copyable code and a Start button
-			pygame.scrap.init()
+		if menu_state == 'webrtc_settings':
+			# Host-only settings menu before starting game
 			screen.fill((255,255,255))
-			title = font.render("WebRTC Host: Room Code", True, (0,80,160))
-			code_rect = pygame.Rect(screen.get_width()//2 - 100, 180, 200, 60)
+			title = font.render("WebRTC Host: Game Settings", True, (0,80,160))
+			screen.blit(title, title.get_rect(center=(screen.get_width()//2, 60)))
+			settings_rects = []
+			for i, (field, label) in enumerate(zip(webrtc_settings_fields, webrtc_settings_labels)):
+				val = str(settings[field])
+				display = f"{label}: {val}" if webrtc_settings_input == '' or webrtc_settings_selected != i else f"{label}: {webrtc_settings_input}"
+				color = (0, 120, 0) if i == webrtc_settings_selected else (0, 0, 0)
+				surf = font.render(display, True, color)
+				rect = surf.get_rect(center=(screen.get_width()//2, 140 + i*50))
+				screen.blit(surf, rect)
+				settings_rects.append(rect)
+			info = small_font.render("Enter value, Enter/Click=Start, Esc=Back", True, (80, 80, 80))
+			screen.blit(info, (screen.get_width()//2 - 200, 140 + len(webrtc_settings_fields)*50))
+			# Draw code and Start button
+			code_rect = pygame.Rect(screen.get_width()//2 - 100, 140 + len(webrtc_settings_fields)*50 + 40, 200, 60)
 			pygame.draw.rect(screen, (220,220,255), code_rect, border_radius=8)
 			code_surf = font.render(webrtc_room_code, True, (0,120,0))
 			code_surf_rect = code_surf.get_rect(center=code_rect.center)
-			screen.blit(title, title.get_rect(center=(screen.get_width()//2, 100)))
 			screen.blit(code_surf, code_surf_rect)
-			info = font.render("Tell the joining player this code.", True, (80,80,80))
 			copy_hint = font.render("Ctrl+C to copy", True, (80,80,160))
-			screen.blit(info, info.get_rect(center=(screen.get_width()//2, 260)))
-			screen.blit(copy_hint, copy_hint.get_rect(center=(screen.get_width()//2, 320)))
-			# Draw Start button
+			screen.blit(copy_hint, copy_hint.get_rect(center=(screen.get_width()//2, code_rect.bottom + 20)))
 			button_font = pygame.font.SysFont(None, 40)
 			start_text = button_font.render("Start", True, (255,255,255))
-			start_rect = pygame.Rect(screen.get_width()//2 - 75, 370, 150, 60)
+			start_rect = pygame.Rect(screen.get_width()//2 - 75, code_rect.bottom + 60, 150, 60)
 			pygame.draw.rect(screen, (0,120,0), start_rect, border_radius=10)
 			screen.blit(start_text, start_text.get_rect(center=start_rect.center))
 			pygame.display.flip()
-			# Wait for Start button click or Ctrl+C
 			for event in pygame.event.get():
 				if event.type == pygame.QUIT:
 					pygame.quit()
 					sys.exit()
 				if event.type == pygame.KEYDOWN:
-					if (event.key == pygame.K_c and (pygame.key.get_mods() & pygame.KMOD_CTRL)):
+					if event.key == pygame.K_UP:
+						webrtc_settings_selected = (webrtc_settings_selected - 1) % len(webrtc_settings_fields)
+						webrtc_settings_input = ''
+					elif event.key == pygame.K_DOWN:
+						webrtc_settings_selected = (webrtc_settings_selected + 1) % len(webrtc_settings_fields)
+						webrtc_settings_input = ''
+					if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+						field = webrtc_settings_fields[webrtc_settings_selected]
+						if webrtc_settings_selected < len(webrtc_settings_fields):
+							# Editing a value, not Start button
+							if webrtc_settings_input:
+								try:
+									val = int(webrtc_settings_input)
+									if field == 'board_width' and val % 2 != 0:
+										continue
+									if val > 0:
+										settings[field] = val
+								except ValueError:
+									pass
+								webrtc_settings_input = ''
+								webrtc_settings_selected = (webrtc_settings_selected + 1) % (len(webrtc_settings_fields)+1)
+						else:
+							# On Start button: send settings to join, then start signaling
+							if webrtc_mode:
+								if webrtc_channel and webrtc_channel.readyState == "open":
+									msg = json.dumps({"type": "settings_sync", "settings": settings})
+									webrtc_channel.send(msg)
+							if not webrtc_initiated:
+								webrtc_mode = True
+								webrtc_initiated = True
+								start_webrtc_thread('host', code=webrtc_room_code)
+							phase = 'menu'
+							menu_state = 'webrtc_wait'
+							break
+					elif event.key == pygame.K_BACKSPACE:
+						webrtc_settings_input = webrtc_settings_input[:-1]
+					elif event.key == pygame.K_ESCAPE:
+						menu_state = 'main'
+						webrtc_settings_input = ''
+					elif event.unicode.isdigit():
+						field = webrtc_settings_fields[webrtc_settings_selected]
+						if field == 'board_width' and len(webrtc_settings_input) == 0 and event.unicode == '0':
+							continue
+						webrtc_settings_input += event.unicode
+				elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+					mouse_pos = event.pos
+					for i, rect in enumerate(settings_rects):
+						if rect.collidepoint(mouse_pos):
+							webrtc_settings_selected = i
+							webrtc_settings_input = ''
+							break
+					if code_rect.collidepoint(mouse_pos):
 						try:
 							pygame.scrap.put(pygame.SCRAP_TEXT, webrtc_room_code.encode('utf-8'))
 						except Exception as e:
 							print(f"[WebRTC] Clipboard copy failed: {e}")
-				if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-					mx, my = event.pos
-					if start_rect.collidepoint(mx, my):
-						print(f"[WebRTC] Host UI: about to call start_webrtc_thread('host', code={webrtc_room_code})")
-						print("[WebRTC] Selected Host. Starting signaling...")
-						webrtc_mode = True
-						webrtc_initiated = True
-						start_webrtc_thread('host', code=webrtc_room_code)
+					if start_rect.collidepoint(mouse_pos):
+						# On Start button: send settings to join, then start signaling
+						if webrtc_mode:
+							if webrtc_channel and webrtc_channel.readyState == "open":
+								msg = json.dumps({"type": "settings_sync", "settings": settings})
+								webrtc_channel.send(msg)
+						if not webrtc_initiated:
+							webrtc_mode = True
+							webrtc_initiated = True
+							start_webrtc_thread('host', code=webrtc_room_code)
+						phase = 'menu'
 						menu_state = 'webrtc_wait'
+						break
 			continue
 		if menu_state == 'webrtc_join' and not webrtc_initiated:
 			# Prepare for code entry
@@ -767,7 +835,7 @@ def main():
 				webrtc_room_code = ''
 			menu_state = 'webrtc_code_join'
 		if menu_state == 'webrtc_code_join':
-			# Draw join code entry UI
+			# Draw join code entry UI and show host's settings (read-only)
 			screen.fill((255,255,255))
 			title = font.render("WebRTC Join: Enter Room Code", True, (0,80,160))
 			code_surf = font.render(webrtc_room_code + '_'*(6-len(webrtc_room_code)), True, (0,120,0))
@@ -777,6 +845,13 @@ def main():
 			screen.blit(code_surf, code_surf.get_rect(center=(screen.get_width()//2, 200)))
 			screen.blit(info, info.get_rect(center=(screen.get_width()//2, 260)))
 			screen.blit(prompt, prompt.get_rect(center=(screen.get_width()//2, 320)))
+			# Show host's settings (read-only)
+			y_offset = 370
+			for field, label in zip(webrtc_settings_fields, webrtc_settings_labels):
+				val = str(settings[field])
+				surf = font.render(f"{label}: {val}", True, (80,80,80))
+				screen.blit(surf, surf.get_rect(center=(screen.get_width()//2, y_offset)))
+				y_offset += 40
 			pygame.display.flip()
 			# Handle code entry
 			for event in pygame.event.get():
@@ -807,12 +882,20 @@ def main():
 				webrtc_ready_players.add(multiplayer_player)
 				if WEBRTC_DEBUG:
 					print(f"[WebRTC] multiplayer_mode set. role={webrtc_role}, player={multiplayer_player}")
-			# Advance to game as soon as data channel is open and multiplayer is ready
-			if menu_state == 'webrtc_wait' and multiplayer_ready:
-				menu_state = 'game'
-				# Initialize game state and enter placement phase
-				phase = 'placement'
-				start_match(reset_score=True)
+				# Host sends settings to join side now that channel is open
+				if webrtc_role == 'host' and webrtc_channel and webrtc_channel.readyState == "open":
+					try:
+						msg = json.dumps({"type": "settings_sync", "settings": settings})
+						webrtc_channel.send(msg)
+						if WEBRTC_DEBUG:
+							print(f"[WebRTC] Sent settings_sync to join: {settings}")
+					except Exception as e:
+						print(f"[WebRTC] Failed to send settings_sync: {e}")
+				# Host can start immediately (already has correct settings)
+				if webrtc_role == 'host' and menu_state == 'webrtc_wait':
+					menu_state = 'game'
+					phase = 'placement'
+					start_match(reset_score=True)
 		# --- WebRTC: flush send queue via data channel ---
 		if webrtc_mode and webrtc_channel_open.is_set() and ws_send_queue:
 			while ws_send_queue:
@@ -843,6 +926,21 @@ def main():
 				elif move.get("type") == "webrtc_ready":
 					# ...existing code...
 					pass
+				elif move.get("type") == "settings_sync":
+					# Host sent settings, update local settings
+					new_settings = move.get("settings")
+					if new_settings:
+						settings.update(new_settings)
+						# Also update board size if already in game
+						BOARD_WIDTH = settings['board_width']
+						BOARD_HEIGHT = settings['board_height']
+						WINDOW_WIDTH = BOARD_WIDTH * CELL_SIZE
+						WINDOW_HEIGHT = BOARD_HEIGHT * CELL_SIZE
+						screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.RESIZABLE)
+					webrtc_settings_synced = True
+					if WEBRTC_DEBUG:
+						print(f"[WebRTC] settings_sync received and applied: {settings}")
+					continue
 				elif move.get("type") == "play_again_ready":
 					player_num = move.get("player")
 					if player_num in (1, 2):
@@ -991,6 +1089,14 @@ def main():
 			# In multiplayer, ensure placement control stays on the local player each frame
 			if multiplayer_mode and multiplayer_player in (1, 2):
 				placement_player = multiplayer_player
+
+		# --- WebRTC Join: start game AFTER settings_sync has been received and applied ---
+		if webrtc_mode and webrtc_role != 'host' and menu_state == 'webrtc_wait' and multiplayer_ready and webrtc_settings_synced:
+			menu_state = 'game'
+			phase = 'placement'
+			start_match(reset_score=True)
+			if WEBRTC_DEBUG:
+				print(f"[WebRTC] Join side starting game with settings: {settings}")
 
 		# Calculate scale and offset for centering (always keep aspect, never stretch, always center)
 		board_px_w = BOARD_WIDTH * CELL_SIZE
@@ -1373,8 +1479,14 @@ def main():
 				title = menu_font.render("WebRTC Setup", True, (0, 80, 160))
 				title_rect = title.get_rect(center=(WINDOW_WIDTH//2, 60))
 				screen.blit(title, title_rect)
+				if webrtc_channel_open.is_set() and not webrtc_settings_synced and webrtc_role != 'host':
+					status_text = "Connected! Waiting for host settings..."
+				elif webrtc_channel_open.is_set():
+					status_text = "Connected! Starting game..."
+				else:
+					status_text = "Waiting for data channel to open..."
 				info_lines = [
-					"Waiting for data channel to open...",
+					status_text,
 					"Press Esc to cancel.",
 				]
 				for i, line in enumerate(info_lines):
