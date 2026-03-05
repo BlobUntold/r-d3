@@ -107,7 +107,7 @@ async def _wait_for_ice_complete(pc):
 
 
 # --- WebRTC Signaling Client ---
-async def webrtc_signaling_client(pc, role, room_code, signaling_uri="ws://localhost:8765"):
+async def webrtc_signaling_client(pc, role, room_code, signaling_uri="ws://13.58.79.109:8765"):
 	"""
 	Handles signaling via the signaling server. Joins a room and exchanges offer/answer/ICE.
 	"""
@@ -459,9 +459,23 @@ def reset_game():
 	)
 
 def main():
-	print("[DEBUG] main() started")
 	global webrtc_mode, webrtc_initiated, webrtc_role, webrtc_settings_synced
 	global WINDOW_WIDTH, WINDOW_HEIGHT, BOARD_WIDTH, BOARD_HEIGHT
+	def reset_multiplayer_state():
+		global webrtc_mode, webrtc_initiated, webrtc_role, webrtc_settings_synced
+		global webrtc_pc, webrtc_channel, webrtc_connected, webrtc_channel_open, webrtc_loop
+		webrtc_mode = False
+		webrtc_initiated = False
+		webrtc_role = None
+		webrtc_settings_synced = False
+		webrtc_pc = None
+		webrtc_channel = None
+		webrtc_connected.clear()
+		webrtc_channel_open.clear()
+		webrtc_loop = None
+		with webrtc_incoming_lock:
+			webrtc_incoming.clear()
+	print("[DEBUG] main() started")
 	BOARD_WIDTH = 26
 	BOARD_HEIGHT = 30
 	pygame.init()
@@ -1158,8 +1172,15 @@ def main():
 								break
 							else:
 								match_winner = 0
-								if not multiplayer_mode:
-									start_match(reset_score=True)
+								reset_multiplayer_state()
+								multiplayer_mode = False
+								multiplayer_ready = False
+								multiplayer_player = None
+								ready_players = set()
+								webrtc_ready_players = set()
+								play_again_ready = set()
+								ws_queue.clear()
+								ws_send_queue.clear()
 								menu_state = 'main'
 								phase = 'menu'
 								flush_events = True
@@ -1167,8 +1188,15 @@ def main():
 								break
 						elif event.key == pygame.K_ESCAPE:
 							match_winner = 0
-							if not multiplayer_mode:
-								start_match(reset_score=True)
+							reset_multiplayer_state()
+							multiplayer_mode = False
+							multiplayer_ready = False
+							multiplayer_player = None
+							ready_players = set()
+							webrtc_ready_players = set()
+							play_again_ready = set()
+							ws_queue.clear()
+							ws_send_queue.clear()
 							menu_state = 'main'
 							phase = 'menu'
 							flush_events = True
@@ -1183,8 +1211,15 @@ def main():
 							break
 						elif home_rect.collidepoint(mx, my):
 							match_winner = 0
-							if not multiplayer_mode:
-								start_match(reset_score=True)
+							reset_multiplayer_state()
+							multiplayer_mode = False
+							multiplayer_ready = False
+							multiplayer_player = None
+							ready_players = set()
+							webrtc_ready_players = set()
+							play_again_ready = set()
+							ws_queue.clear()
+							ws_send_queue.clear()
 							menu_state = 'main'
 							phase = 'menu'
 							flush_events = True
@@ -1849,6 +1884,15 @@ def main():
 						request_play_again()
 						break
 					elif event.key == pygame.K_ESCAPE:
+						reset_multiplayer_state()
+						multiplayer_mode = False
+						multiplayer_ready = False
+						multiplayer_player = None
+						ready_players = set()
+						webrtc_ready_players = set()
+						play_again_ready = set()
+						ws_queue.clear()
+						ws_send_queue.clear()
 						menu_state = 'main'
 						phase = 'menu'
 						break
@@ -1858,6 +1902,15 @@ def main():
 						request_play_again()
 						break
 					elif home_rect.collidepoint(mx, my):
+						reset_multiplayer_state()
+						multiplayer_mode = False
+						multiplayer_ready = False
+						multiplayer_player = None
+						ready_players = set()
+						webrtc_ready_players = set()
+						play_again_ready = set()
+						ws_queue.clear()
+						ws_send_queue.clear()
 						menu_state = 'main'
 						phase = 'menu'
 						break
