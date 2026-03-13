@@ -1,0 +1,4 @@
+pygame
+aiortc
+websockets
+pyinstaller

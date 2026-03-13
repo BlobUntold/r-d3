@@ -725,7 +725,7 @@ def main():
 		# --- Multiplayer: connect on lobby start (robust) ---
 		if menu_state == 'lobby' and not multiplayer_mode:
 			print("[Multiplayer] Entering lobby menu, starting client...")
-			start_ws_client("ws://localhost:8765")
+			start_ws_client("ws://13.58.79.109:8765")
 			multiplayer_mode = True
 			multiplayer_player = None
 			multiplayer_ready = False
@@ -1154,7 +1154,7 @@ def main():
 					# --- Multiplayer: connect on lobby start ---
 					if phase == 'menu' and menu_state == 'lobby' and not multiplayer_mode:
 						print("[Multiplayer] Entering lobby menu, starting client...")
-						start_ws_client("ws://localhost:8765")
+						start_ws_client("ws://13.58.79.109:8765")
 						multiplayer_mode = True
 						multiplayer_player = None
 						print("[Multiplayer] Connecting to server...")
